@@ -9,14 +9,6 @@ This is a Python based DVR app that has many features.
 
 - Advanced motion detection
 
-- Scheduled Recording
-
-- Continuous Recording
-
-- Continuous Motion Recording
-
-- Scheduled Motion Recording
-
 - Windows Support
 
 - RTP/RTSP Support
