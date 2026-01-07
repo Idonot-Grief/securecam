@@ -1,4 +1,4 @@
-# ==================== MAIN DVR SERVER (app.py) - FIXED JSON LOAD + FULL CODE ====================
+# ==================== SECURECAM DVR - RTSP + RESTORED UI + BACKEND FIXES ====================
 import cv2
 import numpy as np
 import threading
@@ -20,7 +20,6 @@ app = Flask(__name__)
 CONFIG_FILE = 'config.json'
 RECORDINGS_DIR = 'recordings'
 SNAPSHOTS_DIR = 'snapshots'
-
 os.makedirs(RECORDINGS_DIR, exist_ok=True)
 os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
 
@@ -29,564 +28,315 @@ DEFAULT_CONFIG = {
     "password": "admin123",
     "fps": 20,
     "camera_grid_columns": 2,
-    "auto_recording": True,
     "recording_mode": "motion",
-    "use_schedules": False,
-    "schedules": [],
     "motion_sensitivity": 5000,
     "motion_post_delay": 10,
     "take_snapshot_on_motion": True,
     "snapshot_min_interval": 5,
-    "enable_securecam_discovery": True,
-    "securecam_discovery_port": 5552,
-    "securecam_video_port": 5554,
+    "retention_days": 28, 
     "cameras": []
 }
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
-            # Fixed: Use UTF-8 encoding to avoid charmap errors
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 cfg = json.load(f)
-            # Backward compatibility - add missing keys
-            for key, val in DEFAULT_CONFIG.items():
-                if key not in cfg:
-                    cfg[key] = val
+            for k, v in DEFAULT_CONFIG.items():
+                if k not in cfg: cfg[k] = v
             return cfg
-        except Exception as e:
-            print(f"Error loading config.json: {e}")
-            print("Creating a fresh default config.json...")
-            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-                json.dump(DEFAULT_CONFIG, f, indent=4)
-            return DEFAULT_CONFIG
-    else:
-        print("No config.json found. Creating default...")
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(DEFAULT_CONFIG, f, indent=4)
-        return DEFAULT_CONFIG
+        except: pass
+    return DEFAULT_CONFIG.copy()
 
 config = load_config()
 config_lock = threading.Lock()
-
 USERNAME = "admin"
+
+def save_config():
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=4)
+
+# === 28-DAY STORAGE CLEANUP ===
+class StorageCleanupThread(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.running = True
+    def run(self):
+        while self.running:
+            now = time.time()
+            cutoff = now - (config.get('retention_days', 28) * 86400)
+            for folder in [RECORDINGS_DIR, SNAPSHOTS_DIR]:
+                try:
+                    for filename in os.listdir(folder):
+                        path = os.path.join(folder, filename)
+                        if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                            os.remove(path)
+                except: pass
+            time.sleep(3600) # Check hourly
 
 # === AUTHENTICATION ===
 def check_auth(username, password):
     return username == USERNAME and password == config.get('password', 'admin123')
 
 def authenticate():
-    return make_response('Authentication required!', 401, {'WWW-Authenticate': 'Basic realm="SecureCam DVR"'})
+    return make_response('Auth Required', 401, {'WWW-Authenticate': 'Basic realm="Login"'})
 
 def requires_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         auth = request.authorization
-        if not auth or not check_auth(auth.username, auth.password):
-            return authenticate()
+        if not auth or not check_auth(auth.username, auth.password): return authenticate()
         return f(*args, **kwargs)
     return decorated
 
-# === LOCAL NETWORK DETECTION ===
-def get_local_network():
-    try:
-        gateways = ni.gateways()
-        default_gw = gateways['default'][ni.AF_INET]
-        iface = default_gw[1]
-        addr = ni.ifaddresses(iface)[ni.AF_INET][0]
-        ip = addr['addr']
-        netmask = addr['netmask']
-        network = ipaddress.ip_network(f"{ip}/{netmask}", strict=False)
-        return str(network)
-    except Exception as e:
-        print(f"Could not detect local network: {e}")
-        return None
-
-# === LAN SCAN THREAD FOR SECURECAM ===
-class LanScanThread(threading.Thread):
-    def __init__(self):
-        super().__init__(daemon=True)
-        self.running = True
-
-    def run(self):
-        if not config.get('enable_securecam_discovery', True):
-            print("SecureCam LAN scan disabled.")
-            return
-
-        network_str = get_local_network()
-        if not network_str:
-            print("Could not determine local network for scanning.")
-            return
-
-        print(f"Starting LAN scan on network: {network_str} (port {config['securecam_video_port']})")
-
-        while self.running:
-            try:
-                for host in ipaddress.ip_network(network_str).hosts():
-                    ip_str = str(host)
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.settimeout(0.3)
-                    try:
-                        result = sock.connect_ex((ip_str, config['securecam_video_port']))
-                        if result == 0:
-                            self.try_add_securecam(ip_str)
-                    finally:
-                        sock.close()
-            except Exception as e:
-                print(f"LAN scan error: {e}")
-            time.sleep(60)  # Scan every minute
-
-    def try_add_securecam(self, ip):
-        with config_lock:
-            for cam in config['cameras']:
-                if cam.get('type') == 'securecam' and cam.get('ip') == ip:
-                    return
-            new_cam = {
-                "type": "securecam",
-                "name": f"SecureCam-{ip.split('.')[-1]}",
-                "ip": ip,
-                "video_port": config['securecam_video_port']
-            }
-            config['cameras'].append(new_cam)
-            print(f"+++ LAN scan discovered SecureCam at {ip}")
-            try:
-                with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-                    json.dump(config, f, indent=4)
-                restart_cameras()
-            except Exception as e:
-                print(f"Failed to save config: {e}")
-
-    def stop(self):
-        self.running = False
-
-lan_scan_thread = LanScanThread()
-if config.get('enable_securecam_discovery', True):
-    lan_scan_thread.start()
-
-def cleanup():
-    if 'lan_scan_thread' in globals():
-        lan_scan_thread.stop()
-        lan_scan_thread.join(timeout=2)
-
-atexit.register(cleanup)
-
-# === CAMERA THREAD (unchanged) ===
+# === CAMERA ENGINE (RTSP ENABLED) ===
 class CameraThread(threading.Thread):
     def __init__(self, cam_config, cam_id):
         super().__init__(daemon=True)
         self.cam_id = cam_id
-        self.config = cam_config
-        self.name = cam_config.get('name', f'Cam {cam_id + 1}')
+        self.name = cam_config.get('name', 'Cam')
+        self.source = cam_config.get('source')
         self.type = cam_config.get('type', 'local')
-        self.source = cam_config.get('source') if 'source' in cam_config else None
         self.ip = cam_config.get('ip')
-        self.video_port = cam_config.get('video_port', 5554)
-        self.cap = None
         self.latest_frame = None
         self.recording = False
         self.writer = None
-        self.last_motion_time = 0
-        self.last_snapshot_time = 0
+        self.last_motion = 0
+        self.prev_gray = None
         self.frame_lock = threading.Lock()
+        self.stop_signal = False
 
     def run(self):
-        while True:
+        while not self.stop_signal:
             if self.type == 'securecam':
                 try:
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.settimeout(10)
-                    sock.connect((self.ip, self.video_port))
-                    file_conn = sock.makefile('rb')
-                    print(f"Connected to SecureCam: {self.name} ({self.ip}:{self.video_port})")
-                except Exception as e:
-                    print(f"SecureCam connect failed ({self.name}): {e}. Retrying...")
-                    time.sleep(5)
-                    continue
-
-                while True:
-                    try:
-                        size_data = file_conn.read(4)
-                        if len(size_data) < 4:
-                            break
-                        frame_size = struct.unpack('>I', size_data)[0]
-                        jpeg_data = b''
-                        while len(jpeg_data) < frame_size:
-                            packet = file_conn.read(frame_size - len(jpeg_data))
-                            if not packet:
-                                break
-                            jpeg_data += packet
-                        if len(jpeg_data) != frame_size:
-                            break
-                        frame = cv2.imdecode(np.frombuffer(jpeg_data, dtype=np.uint8), cv2.IMREAD_COLOR)
-                        if frame is None:
-                            continue
-                    except:
-                        break
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(5)
+                    s.connect((self.ip, 5554))
+                    conn = s.makefile('rb')
+                    while not self.stop_signal:
+                        header = conn.read(4)
+                        if not header: break
+                        sz = struct.unpack('>I', header)[0]
+                        frame = cv2.imdecode(np.frombuffer(conn.read(sz), np.uint8), cv2.IMREAD_COLOR)
+                        if frame is not None: self.process_frame(frame)
+                    s.close()
+                except: time.sleep(5)
+            else:
+                # RTSP and Local use VideoCapture
+                cap = cv2.VideoCapture(self.source)
+                # Optimize for RTSP buffer lag
+                if self.type == 'rtsp':
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 3) 
+                
+                while not self.stop_signal and cap.isOpened():
+                    ret, frame = cap.read()
+                    if not ret: break
                     self.process_frame(frame)
-
-                sock.close()
+                cap.release()
                 time.sleep(3)
 
-            else:
-                if self.source is not None:
-                    if isinstance(self.source, int):
-                        self.cap = cv2.VideoCapture(self.source)
-                    else:
-                        self.cap = cv2.VideoCapture(self.source)
-                        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                    if not self.cap.isOpened():
-                        time.sleep(3)
-                        continue
-
-                prev_gray = None
-                while True:
-                    if not self.cap.isOpened():
-                        time.sleep(0.1)
-                        continue
-                    ret, frame = self.cap.read()
-                    if not ret:
-                        time.sleep(0.1)
-                        continue
-                    self.process_frame(frame, prev_gray=prev_gray)
-                    prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-    def process_frame(self, frame, prev_gray=None):
+    def process_frame(self, frame):
         h, w = frame.shape[:2]
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        cv2.putText(frame, ts, (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-
-        motion_detected = False
-        if prev_gray is not None:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            gray = cv2.GaussianBlur(gray, (21, 21), 0)
-            delta = cv2.absdiff(prev_gray, gray)
+        cv2.putText(frame, ts, (10, h-20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+        
+        # Motion detection logic
+        gray = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (21,21), 0)
+        motion = False
+        if self.prev_gray is not None:
+            delta = cv2.absdiff(self.prev_gray, gray)
             thresh = cv2.threshold(delta, 25, 255, cv2.THRESH_BINARY)[1]
-            thresh = cv2.dilate(thresh, None, iterations=2)
-            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            motion_detected = any(cv2.contourArea(c) > config['motion_sensitivity'] for c in contours)
-            if motion_detected:
-                self.last_motion_time = time.time()
-                if (config.get('take_snapshot_on_motion', True) and
-                    time.time() - self.last_snapshot_time >= config.get('snapshot_min_interval', 5)):
-                    self.save_snapshot(frame.copy())
-                    self.last_snapshot_time = time.time()
-
-        should_record = self.should_record(motion_detected)
-
-        if should_record and not self.recording:
-            filename = f"{self.name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.webm"
-            path = os.path.join(RECORDINGS_DIR, filename)
-            fourcc = cv2.VideoWriter_fourcc(*'VP80')
-            self.writer = cv2.VideoWriter(path, fourcc, config['fps'], (w, h))
-            self.recording = True
-            print(f"[REC START] {filename}")
-
-        if should_record and self.recording:
+            contours, _ = cv2.findContours(cv2.dilate(thresh, None, iterations=2), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            motion = any(cv2.contourArea(c) > config['motion_sensitivity'] for c in contours)
+            if motion: self.last_motion = time.time()
+        
+        self.prev_gray = gray
+        
+        # Determine if we should record
+        should_rec = (config['recording_mode'] == "continuous") or (time.time() - self.last_motion < config['motion_post_delay'])
+        
+        if should_rec:
+            if not self.recording:
+                fn = f"{self.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.webm"
+                self.writer = cv2.VideoWriter(os.path.join(RECORDINGS_DIR, fn), cv2.VideoWriter_fourcc(*'VP80'), config['fps'], (w, h))
+                self.recording = True
             self.writer.write(frame)
-
-        if not should_record and self.recording:
+        elif self.recording:
             self.writer.release()
-            self.writer = None
             self.recording = False
-            print(f"[REC STOP] {self.name}")
 
         with self.frame_lock:
-            ret, jpeg = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            if ret:
-                self.latest_frame = jpeg.tobytes()
-
-    def should_record(self, motion_detected):
-        now = datetime.now()
-        if config['use_schedules']:
-            weekday = now.weekday()
-            time_str = now.strftime("%H:%M")
-            in_schedule = any(weekday in s['days'] and s['start'] <= time_str < s['end'] for s in config['schedules'])
-            if not in_schedule:
-                return False
-            return config['recording_mode'] == "continuous" or \
-                   (config['recording_mode'] == "motion" and (motion_detected or time.time() - self.last_motion_time < config['motion_post_delay']))
-        else:
-            if not config['auto_recording']:
-                return False
-            return config['recording_mode'] == "continuous" or \
-                   (config['recording_mode'] == "motion" and (motion_detected or time.time() - self.last_motion_time < config['motion_post_delay']))
-
-    def save_snapshot(self, frame):
-        filename = f"{self.name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-        cv2.imwrite(os.path.join(SNAPSHOTS_DIR, filename), frame)
+            _, jpeg = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            self.latest_frame = jpeg.tobytes()
 
     def get_frame(self):
-        with self.frame_lock:
-            return self.latest_frame
+        with self.frame_lock: return self.latest_frame
 
 camera_threads = []
-
 def restart_cameras():
     global camera_threads
-    for t in camera_threads:
-        if hasattr(t, 'cap') and t.cap and t.cap.isOpened():
-            t.cap.release()
+    for t in camera_threads: t.stop_signal = True
     camera_threads = []
-    for i, cam_cfg in enumerate(config['cameras']):
-        thread = CameraThread(cam_cfg, i)
-        thread.start()
-        camera_threads.append(thread)
-    print(f"Restarted {len(camera_threads)} camera(s)")
+    for i, c in enumerate(config['cameras']):
+        t = CameraThread(c, i)
+        t.start()
+        camera_threads.append(t)
 
-restart_cameras()
-
-# === STREAMING ===
-def generate_stream(cam_id):
-    while True:
-        frame = camera_threads[cam_id].get_frame()
-        if frame:
-            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-        time.sleep(1 / config['fps'])
+# === WEB ROUTES ===
+@app.route('/')
+@requires_auth
+def index():
+    return render_template_string(MAIN_HTML, config=config, cameras=config['cameras'], now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
 @app.route('/video_feed/<int:cam_id>')
 @requires_auth
 def video_feed(cam_id):
-    if cam_id >= len(camera_threads):
-        abort(404)
-    return Response(generate_stream(cam_id), mimetype='multipart/x-mixed-replace; boundary=frame')
+    if cam_id >= len(camera_threads): abort(404)
+    def gen():
+        while True:
+            f = camera_threads[cam_id].get_frame()
+            if f: yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + f + b'\r\n')
+            time.sleep(1/config['fps'])
+    return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-# === MAIN PAGE ===
-@app.route('/')
-@requires_auth
-def index():
-    HTML = """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <title>SecureCam DVR</title>
-        <style>
-            body { background:#121212; color:white; font-family:Arial; text-align:center; margin:0; }
-            h1 { padding:20px; }
-            nav { background:#1e1e1e; padding:15px; }
-            nav a { color:#00ff99; margin:0 20px; text-decoration:none; font-weight:bold; }
-            .grid { display:grid; grid-template-columns:repeat({{ cols }}, 1fr); gap:20px; padding:20px; }
-            .cam { text-align:center; }
-            img { width:100%; border:3px solid #444; border-radius:10px; }
-            .footer { color:#888; padding:15px; }
-        </style>
-    </head>
-    <body>
-        <h1>🔒 SecureCam DVR</h1>
-        <nav>
-            <a href="/">Live View</a> |
-            <a href="/recordings">Recordings</a> |
-            <a href="/snapshots">Motion Snapshots</a> |
-            <a href="/admin">Admin Panel</a>
-        </nav>
-        {% if cameras %}
-        <div class="grid">
-            {% for cam in cameras %}
-            <div class="cam">
-                <h3>{{ cam.name }}</h3>
-                <img src="{{ url_for('video_feed', cam_id=loop.index0) }}">
-            </div>
-            {% endfor %}
-        </div>
-        {% else %}
-        <p>No cameras configured. Go to <a href="/admin">Admin Panel</a> to add them.</p>
-        {% endif %}
-        <div class="footer">Time: {{ now }}</div>
-    </body>
-    </html>
-    """
-    return render_template_string(HTML,
-                                 now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                 cols=config['camera_grid_columns'],
-                                 cameras=config['cameras'])
-
-# === RECORDINGS & SNAPSHOTS (unchanged) ===
 @app.route('/recordings')
 @requires_auth
-def recordings_gallery():
+def recordings():
     files = sorted([f for f in os.listdir(RECORDINGS_DIR) if f.endswith('.webm')], reverse=True)
-    if not files: return "<h1>Recordings</h1><p>No recordings yet.</p><a href='/'>Back</a>"
-    html = "<h1>Recordings Gallery</h1><nav><a href='/'>← Back</a></nav><br>"
-    for f in files:
-        p = url_for('serve_recording', filename=f)
-        html += f"<div style='margin:40px auto;max-width:1000px;text-align:center;'><h3>{f}</h3><video controls style='width:100%;max-height:600px;background:#000;border-radius:8px;'><source src='{p}' type='video/webm'></video><br><a href='{p}' download style='color:#00ff99;'>Download</a></div><hr>"
-    return html
-
-@app.route('/recordings/<filename>')
-@requires_auth
-def serve_recording(filename):
-    return send_from_directory(RECORDINGS_DIR, filename)
+    return render_template_string(RECORDINGS_HTML, files=files)
 
 @app.route('/snapshots')
 @requires_auth
-def snapshots_gallery():
+def snapshots():
     files = sorted([f for f in os.listdir(SNAPSHOTS_DIR) if f.endswith('.jpg')], reverse=True)
-    if not files: return "<h1>Snapshots</h1><p>No snapshots yet.</p><a href='/'>Back</a>"
-    html = "<h1>Motion Snapshots</h1><nav><a href='/'>← Back</a></nav><br><div style='display:grid;grid-template-columns:repeat(auto-fill,minmax(400px,1fr));gap:20px;'>"
-    for f in files:
-        p = url_for('serve_snapshot', filename=f)
-        html += f"<div style='text-align:center;'><img src='{p}' style='width:100%;border-radius:8px;border:3px solid #555;'><br><small>{f}</small><br><a href='{p}' download>Download</a></div>"
-    html += "</div>"
-    return html
+    return render_template_string(SNAPSHOTS_HTML, files=files)
 
-@app.route('/snapshots/<filename>')
+@app.route('/files/<folder>/<filename>')
 @requires_auth
-def serve_snapshot(filename):
-    return send_from_directory(SNAPSHOTS_DIR, filename)
+def serve_file(folder, filename):
+    return send_from_directory(RECORDINGS_DIR if folder=='rec' else SNAPSHOTS_DIR, filename)
 
-# === GUI ADMIN PANEL (unchanged) ===
 @app.route('/admin')
 @requires_auth
-def admin_gui():
-    return render_template_string("""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <title>Admin Panel - SecureCam DVR</title>
-        <style>
-            body { background:#121212; color:#fff; font-family:Arial; padding:20px; }
-            h1, h2, h3 { color:#0f0; }
-            a { color:#00ff99; }
-            table { width:100%; border-collapse:collapse; margin:20px 0; }
-            th, td { border:1px solid #444; padding:10px; text-align:left; }
-            input, select, button { padding:8px; margin:5px 0; background:#222; color:#fff; border:1px solid #444; }
-            button { background:#0f0; color:#000; border:none; cursor:pointer; }
-            button.delete { background:#f00; color:#fff; }
-            form { margin:20px 0; }
-        </style>
-    </head>
-    <body>
-        <h1>Admin Panel</h1>
-        <p><a href="/">← Back to Live View</a></p>
+def admin():
+    return render_template_string(ADMIN_HTML, config=config, enumerate=enumerate)
 
-        <h2>General Settings</h2>
-        <form action="/admin/save_general" method="post">
-            Password: <input type="text" name="password" value="{{ password }}"><br>
-            FPS: <input type="number" name="fps" value="{{ fps }}" min="5" max="60"><br>
-            Grid Columns: <input type="number" name="camera_grid_columns" value="{{ cols }}" min="1" max="6"><br>
-            Motion Sensitivity: <input type="number" name="motion_sensitivity" value="{{ sensitivity }}" min="1000" max="20000"><br>
-            Snapshot Interval (sec): <input type="number" name="snapshot_min_interval" value="{{ snapshot_interval }}" min="1" max="60"><br>
-            <button type="submit">Save Settings</button>
-        </form>
-
-        <h2>Cameras ({{ cameras|length }} found)</h2>
-        <table>
-            <tr><th>ID</th><th>Name</th><th>Type</th><th>Source / IP</th><th>Actions</th></tr>
-            {% for cam in cameras %}
-            <tr>
-                <td>{{ loop.index }}</td>
-                <td>
-                    <form action="/admin/edit_camera/{{ loop.index0 }}" method="post" style="display:inline;">
-                        <input type="text" name="name" value="{{ cam.name }}" style="width:200px;">
-                        <button type="submit">Save</button>
-                    </form>
-                </td>
-                <td>{{ cam.type|default('local') }}</td>
-                <td>
-                    {% if cam.type == 'securecam' %}{{ cam.ip }}:{{ cam.video_port|default('5554') }}
-                    {% else %}{{ cam.source|default('') }}{% endif %}
-                </td>
-                <td>
-                    <form action="/admin/delete_camera/{{ loop.index0 }}" method="post" style="display:inline;">
-                        <button type="submit" class="delete">Delete</button>
-                    </form>
-                </td>
-            </tr>
-            {% endfor %}
-        </table>
-
-        <h2>Add New Camera</h2>
-        <form action="/admin/add_camera" method="post">
-            Name: <input type="text" name="name" required style="width:200px;"><br><br>
-            Type: 
-            <select name="type">
-                <option value="local">Local Webcam (USB/index)</option>
-                <option value="rtsp">RTSP / Network Camera</option>
-                <option value="securecam">SecureCam Client (LAN)</option>
-            </select><br><br>
-            Source / IP: <input type="text" name="source" placeholder="e.g. 0 or rtsp://... or 192.168.1.100" required style="width:300px;"><br><br>
-            <button type="submit">Add Camera</button>
-        </form>
-
-        <p><small>SecureCam clients are auto-discovered via LAN scan. Manual add as fallback.</small></p>
-    </body>
-    </html>
-    """,
-    password=config['password'],
-    fps=config['fps'],
-    cols=config['camera_grid_columns'],
-    sensitivity=config['motion_sensitivity'],
-    snapshot_interval=config.get('snapshot_min_interval', 5),
-    cameras=config['cameras'])
-
-# Admin routes unchanged from previous version...
 @app.route('/admin/save_general', methods=['POST'])
 @requires_auth
 def save_general():
-    global config
     with config_lock:
         config['password'] = request.form['password']
         config['fps'] = int(request.form['fps'])
         config['camera_grid_columns'] = int(request.form['camera_grid_columns'])
         config['motion_sensitivity'] = int(request.form['motion_sensitivity'])
-        config['snapshot_min_interval'] = int(request.form['snapshot_min_interval'])
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=4)
-    restart_cameras()
+        config['motion_post_delay'] = int(request.form['motion_post_delay'])
+        save_config()
     return redirect('/admin')
 
-@app.route('/admin/add_camera', methods=['POST'])
+@app.route('/admin/add_cam', methods=['POST'])
 @requires_auth
-def add_camera():
-    global config
-    name = request.form['name']
-    cam_type = request.form['type']
-    source = request.form['source']
-
-    new_cam = {"name": name}
-    if cam_type == 'local':
-        new_cam['source'] = int(source) if source.isdigit() else source
-    elif cam_type == 'rtsp':
-        new_cam['source'] = source
-    elif cam_type == 'securecam':
-        new_cam['type'] = 'securecam'
-        new_cam['ip'] = source
-        new_cam['video_port'] = config['securecam_video_port']
-
+def add_cam():
+    name, typ, src = request.form['name'], request.form['type'], request.form['src']
+    new_cam = {"name": name, "type": typ}
+    if typ == "securecam": 
+        new_cam["ip"] = src
+    else: 
+        # For local, convert to int; for RTSP, keep as string URL
+        new_cam["source"] = int(src) if src.isdigit() else src
     with config_lock:
         config['cameras'].append(new_cam)
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=4)
+        save_config()
     restart_cameras()
     return redirect('/admin')
 
-@app.route('/admin/edit_camera/<int:idx>', methods=['POST'])
+@app.route('/admin/del_cam/<int:i>', methods=['POST'])
 @requires_auth
-def edit_camera(idx):
-    global config
+def del_cam(i):
     with config_lock:
-        config['cameras'][idx]['name'] = request.form['name']
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=4)
-    return redirect('/admin')
-
-@app.route('/admin/delete_camera/<int:idx>', methods=['POST'])
-@requires_auth
-def delete_camera(idx):
-    global config
-    with config_lock:
-        if 0 <= idx < len(config['cameras']):
-            del config['cameras'][idx]
-            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-                json.dump(config, f, indent=4)
+        if 0 <= i < len(config['cameras']): del config['cameras'][i]
+        save_config()
     restart_cameras()
     return redirect('/admin')
+
+# === HTML TEMPLATES (RTSP UI RESTORED) ===
+MAIN_HTML = """
+<!DOCTYPE html><html><head><title>SecureCam DVR</title>
+<style>
+    body{background:#121212;color:#fff;font-family:sans-serif;margin:0;text-align:center;}
+    nav{background:#1e1e1e;padding:15px;} nav a{color:#0f0;margin:0 15px;text-decoration:none;font-weight:bold;}
+    .grid{display:grid;grid-template-columns:repeat({{config.camera_grid_columns}},1fr);gap:20px;padding:20px;}
+    img{width:100%;border-radius:12px;border:3px solid #333;box-shadow:0 10px 20px rgba(0,0,0,0.5);}
+    .cam-card{background:#1e1e1e;padding:10px;border-radius:12px;}
+</style></head>
+<body><h1>🔒 SecureCam DVR</h1><nav><a href="/">Live</a>|<a href="/recordings">Recordings</a>|<a href="/snapshots">Snapshots</a>|<a href="/admin">Admin</a></nav>
+<div class="grid">{% for c in cameras %}<div class="cam-card"><h3>{{c.name}}</h3><img src="{{url_for('video_feed',cam_id=loop.index0)}}"></div>{% endfor %}</div>
+<div style="color:#666;margin-bottom:20px;">Retention: {{config.retention_days}} Days | {{now}}</div></body></html>"""
+
+RECORDINGS_HTML = """
+<!DOCTYPE html><html><body style="background:#121212;color:#fff;text-align:center;font-family:sans-serif;">
+<h1>Recordings (28-Day Retention)</h1><a href="/" style="color:#0f0;text-decoration:none;">← Back</a><hr>
+{% for f in files %}<div style="margin-bottom:40px;"><h3>{{f}}</h3><video controls width="720" style="border-radius:10px;"><source src="/files/rec/{{f}}" type="video/webm"></video></div>{% endfor %}
+</body></html>"""
+
+SNAPSHOTS_HTML = """
+<!DOCTYPE html><html><body style="background:#121212;color:#fff;text-align:center;font-family:sans-serif;">
+<h1>Snapshots</h1><a href="/" style="color:#0f0;text-decoration:none;">← Back</a><hr>
+<div style="display:flex; flex-wrap:wrap; justify-content:center;">
+{% for f in files %}<div style="margin:15px;background:#1e1e1e;padding:10px;border-radius:8px;"><img src="/files/snap/{{f}}" width="350" style="border-radius:5px;"><br><small>{{f}}</small></div>{% endfor %}
+</div></body></html>"""
+
+ADMIN_HTML = """
+<!DOCTYPE html><html><head><title>Admin Panel</title>
+<style>
+    body{background:#121212;color:#fff;font-family:sans-serif;padding:20px;}
+    .card{background:#1e1e1e;padding:20px;border-radius:12px;margin-bottom:20px;max-width:700px;margin-left:auto;margin-right:auto;box-shadow:0 4px 15px rgba(0,0,0,0.4);}
+    input, select{width:95%;padding:10px;margin:10px 0;background:#2a2a2a;color:#fff;border:1px solid #444;border-radius:5px;}
+    button{background:#0f0;color:#000;border:none;padding:12px;width:100%;font-weight:bold;cursor:pointer;border-radius:5px;transition:0.2s;}
+    button:hover{background:#0c0;transform:scale(1.01);}
+    table{width:100%;margin-top:15px;border-collapse:collapse;} td,th{padding:10px;text-align:left;border-bottom:1px solid #333;}
+</style></head>
+<body><h1 style="text-align:center;color:#0f0;">Admin Settings</h1><p style="text-align:center;"><a href="/" style="color:#0f0;text-decoration:none;">← Back to Live View</a></p>
+<div class="card">
+    <h2>General Settings</h2>
+    <form action="/admin/save_general" method="post">
+        <label>System Password</label><input type="text" name="password" value="{{config.password}}">
+        <label>Streaming FPS</label><input type="number" name="fps" value="{{config.fps}}">
+        <label>Grid Columns</label><input type="number" name="camera_grid_columns" value="{{config.camera_grid_columns}}">
+        <label>Motion Sensitivity (Lower = More Sensitive)</label><input type="number" name="motion_sensitivity" value="{{config.motion_sensitivity}}">
+        <label>Post-Motion Delay (Seconds)</label><input type="number" name="motion_post_delay" value="{{config.motion_post_delay}}">
+        <button type="submit">Update Core Settings</button>
+    </form>
+</div>
+<div class="card">
+    <h2>Camera Management</h2>
+    <table>
+        <tr><th>Name</th><th>Type</th><th>Action</th></tr>
+        {% for i, c in enumerate(config.cameras) %}
+        <tr><td>{{c.name}}</td><td>{{c.type}}</td><td>
+            <form action="/admin/del_cam/{{i}}" method="post"><button style="background:#f44;padding:5px 10px;width:auto;">Remove</button></form>
+        </td></tr>
+        {% endfor %}
+    </table>
+    <hr style="border:0;border-top:1px solid #444;margin:20px 0;">
+    <h3>Add New Stream</h3>
+    <form action="/admin/add_cam" method="post">
+        <input type="text" name="name" placeholder="Friendly Camera Name" required>
+        <select name="type">
+            <option value="local">Local Webcam (USB)</option>
+            <option value="rtsp">RTSP / IP Camera Stream</option>
+            <option value="securecam">SecureCam Client (LAN)</option>
+        </select>
+        <input type="text" name="src" placeholder="Source: (e.g. 0 or rtsp://admin:pass@192.168.1.50/stream)" required>
+        <button type="submit">Add Camera Source</button>
+    </form>
+</div>
+<div class="card" style="text-align:center;border:1px dashed #0f0;">
+    <p>Storage Policy: <strong>28-Day Auto-Cleanup</strong> is active.</p>
+</div>
+</body></html>"""
 
 if __name__ == '__main__':
-    print("\n=== SecureCam DVR Started ===")
-    print("Fixed: config.json now loaded with UTF-8 encoding")
-    print("GUI Admin + LAN auto-discovery for SecureCam")
-    print("http://YOUR_IP:5000 | Login: admin / your_password")
-    print("==========================================\n")
+    StorageCleanupThread().start()
+    restart_cameras()
     app.run(host='0.0.0.0', port=5000, threaded=True)
